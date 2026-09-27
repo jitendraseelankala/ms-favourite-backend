@@ -14,7 +14,10 @@ db.exec(`
     created_at TEXT NOT NULL,
     claimed INTEGER NOT NULL DEFAULT 0,
     claimed_at TEXT,
-    voucher_applied TEXT
+    voucher_applied TEXT,
+    status TEXT NOT NULL DEFAULT 'received',
+    order_type TEXT NOT NULL DEFAULT 'collection',
+    address TEXT
   );
 
   CREATE TABLE IF NOT EXISTS stamps (
@@ -32,5 +35,11 @@ db.exec(`
     used_on_order TEXT
   );
 `);
+
+// Lightweight migration for databases created before status/order_type/address existed
+const existingCols = db.prepare("PRAGMA table_info(orders)").all().map(c => c.name);
+if (!existingCols.includes('status')) db.exec("ALTER TABLE orders ADD COLUMN status TEXT NOT NULL DEFAULT 'received'");
+if (!existingCols.includes('order_type')) db.exec("ALTER TABLE orders ADD COLUMN order_type TEXT NOT NULL DEFAULT 'collection'");
+if (!existingCols.includes('address')) db.exec("ALTER TABLE orders ADD COLUMN address TEXT");
 
 module.exports = db;
