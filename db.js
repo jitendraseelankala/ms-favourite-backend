@@ -34,6 +34,21 @@ db.exec(`
     used_at TEXT,
     used_on_order TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS checkouts (
+    session_id TEXT PRIMARY KEY,
+    phone TEXT,
+    items_json TEXT NOT NULL,
+    total REAL NOT NULL,
+    order_type TEXT NOT NULL DEFAULT 'collection',
+    address TEXT,
+    wants_stamp INTEGER NOT NULL DEFAULT 0,
+    voucher_code TEXT,
+    voucher_discount REAL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    order_code TEXT,
+    created_at TEXT NOT NULL
+  );
 `);
 
 // Lightweight migration for databases created before status/order_type/address existed
