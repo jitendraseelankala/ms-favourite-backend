@@ -8,10 +8,14 @@ app.use(cors());
 // IMPORTANT: the Stripe webhook route must come BEFORE express.json() below,
 // and use express.raw() instead — Stripe's signature check needs the exact
 // raw request body, not the parsed/re-serialized version.
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY || '');
+const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STRIPE_SECRET_KEY) : null;
+if (!stripe) {
+  console.warn('⚠️  STRIPE_SECRET_KEY is not set — the rest of the site will run fine, but payment and webhook routes will return an error until it is added.');
+}
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 
 app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), (req, res) => {
+  if (!stripe) return res.status(503).send('Payments are not configured on this server yet.');
   let event;
   try {
     event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
@@ -312,8 +316,8 @@ app.post('/api/checkout/create-session', async (req, res) => {
   if (!Array.isArray(items) || items.length === 0) {
     return res.status(400).json({ error: 'No items in basket' });
   }
-  if (!process.env.STRIPE_SECRET_KEY) {
-    return res.status(500).json({ error: 'Payments are not configured yet — STRIPE_SECRET_KEY is missing on the server.' });
+  if (!stripe) {
+    return res.status(503).json({ error: 'Payments are not configured yet — STRIPE_SECRET_KEY is missing on the server.' });
   }
 
   try {
