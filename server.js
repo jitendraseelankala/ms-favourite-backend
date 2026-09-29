@@ -4,6 +4,56 @@ const db = require('./db');
 
 const app = express();
 app.use(cors());
+
+// IMPORTANT: the Stripe webhook route must come BEFORE express.json() below,
+// and use express.raw() instead — Stripe's signature check needs the exact
+// raw request body, not the parsed/re-serialized version.
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY || '');
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+
+app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), (req, res) => {
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature check failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    handlePaymentConfirmed(session.id).catch(e => console.error('Error finalising order:', e));
+  }
+
+  res.json({ received: true });
+});
+
+function handlePaymentConfirmed(sessionId) {
+  const checkout = db.prepare('SELECT * FROM checkouts WHERE session_id=?').get(sessionId);
+  if (!checkout) { console.error('No checkout row for session', sessionId); return Promise.resolve(); }
+  if (checkout.status === 'completed') return Promise.resolve(); // already handled (Stripe can retry webhooks)
+
+  const items = JSON.parse(checkout.items_json);
+  const hasMeal = items.some(it => it.cat === 'mealsHalal');
+  const code = uniqueOrderCode();
+  const now = new Date().toISOString();
+
+  const tx = db.transaction(() => {
+    db.prepare(`
+      INSERT INTO orders (code, phone, items_json, total, has_meal, created_at, claimed, status, order_type, address)
+      VALUES (?, ?, ?, ?, ?, ?, 0, 'received', ?, ?)
+    `).run(code, checkout.phone, checkout.items_json, checkout.total, hasMeal ? 1 : 0, now, checkout.order_type, checkout.address);
+
+    if (checkout.voucher_code) {
+      db.prepare('UPDATE vouchers SET used=1, used_at=?, used_on_order=? WHERE code=?').run(now, code, checkout.voucher_code);
+    }
+
+    db.prepare("UPDATE checkouts SET status='completed', order_code=? WHERE session_id=?").run(code, sessionId);
+  });
+  tx();
+  return Promise.resolve();
+}
+
 app.use(express.json());
 
 const STAMP_TARGET = 5; // 5 stamps -> voucher for a free 6th meal
@@ -248,6 +298,99 @@ app.post('/api/delivery/quote', async (req, res) => {
     fee,
     freeThreshold: FREE_DELIVERY_THRESHOLD,
     matchedAddress: geo.display_name
+  });
+});
+
+// ---------------------------------------------------------------------------
+// POST /api/checkout/create-session — builds a real Stripe payment page
+// body: { phone, items, orderType, address, wantsStamp, voucherCode, voucherDiscount }
+// Nothing in "orders" is created here — only after Stripe confirms payment
+// (via the webhook above) does a real order + Stamp Card code get generated.
+// ---------------------------------------------------------------------------
+app.post('/api/checkout/create-session', async (req, res) => {
+  const { phone, items, orderType, address, wantsStamp, voucherCode, voucherDiscount } = req.body || {};
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'No items in basket' });
+  }
+  if (!process.env.STRIPE_SECRET_KEY) {
+    return res.status(500).json({ error: 'Payments are not configured yet — STRIPE_SECRET_KEY is missing on the server.' });
+  }
+
+  try {
+    const line_items = [];
+    const discount = Number(voucherDiscount) || 0;
+    let discountRemaining = discount;
+
+    for (const it of items) {
+      const unitPence = Math.round(Number(it.price) * 100);
+      const qty = Number(it.qty) || 1;
+      const name = it.n + (it.drink ? ` (${it.drink})` : '');
+
+      if (discountRemaining > 0 && voucherCode && it.cat === 'mealsHalal' && qty >= 1) {
+        // discount exactly one unit of this meal line (the one the voucher applies to)
+        const discountedUnitPence = Math.max(0, unitPence - Math.round(discountRemaining * 100));
+        discountRemaining = 0;
+        if (qty > 1) {
+          line_items.push({ price_data: { currency: 'gbp', product_data: { name }, unit_amount: unitPence }, quantity: qty - 1 });
+        }
+        line_items.push({ price_data: { currency: 'gbp', product_data: { name: name + ' (Rewards voucher applied)' }, unit_amount: discountedUnitPence }, quantity: 1 });
+      } else {
+        line_items.push({ price_data: { currency: 'gbp', product_data: { name }, unit_amount: unitPence }, quantity: qty });
+      }
+    }
+
+    const itemsTotal = items.reduce((sum, it) => sum + Number(it.price) * (Number(it.qty) || 1), 0);
+    let deliveryFee = 0;
+    if (orderType === 'delivery') {
+      deliveryFee = itemsTotal - discount >= FREE_DELIVERY_THRESHOLD ? 0 : DELIVERY_FEE;
+      if (deliveryFee > 0) {
+        line_items.push({ price_data: { currency: 'gbp', product_data: { name: 'Delivery fee' }, unit_amount: Math.round(deliveryFee * 100) }, quantity: 1 });
+      }
+    }
+
+    const total = Math.max(0, itemsTotal - discount + deliveryFee);
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      // No payment_method_types set on purpose — this lets the payment methods
+      // you enable in the Stripe Dashboard (Settings > Payment methods) control
+      // what shows here. Cards + Apple Pay are on by default; Google Pay must be
+      // switched on there too (it's off by default on new Stripe accounts).
+      line_items,
+      success_url: `${req.headers.origin || 'https://ms-favourite.pages.dev'}/?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${req.headers.origin || 'https://ms-favourite.pages.dev'}/?payment=cancelled`,
+      customer_email: undefined,
+      phone_number_collection: { enabled: false }
+    });
+
+    db.prepare(`
+      INSERT INTO checkouts (session_id, phone, items_json, total, order_type, address, wants_stamp, voucher_code, voucher_discount, status, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    `).run(session.id, normPhone(phone) || null, JSON.stringify(items), total, orderType || 'collection', address || null, wantsStamp ? 1 : 0, voucherCode || null, discount || null, new Date().toISOString());
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('Stripe session error:', err.message);
+    res.status(502).json({ error: 'Could not start payment — please try again.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/checkout/session/:sessionId — the site polls this after returning
+// from Stripe, to find out once the webhook has finished creating the order.
+// ---------------------------------------------------------------------------
+app.get('/api/checkout/session/:sessionId', (req, res) => {
+  const checkout = db.prepare('SELECT * FROM checkouts WHERE session_id=?').get(req.params.sessionId);
+  if (!checkout) return res.status(404).json({ error: 'Checkout not found' });
+  if (checkout.status !== 'completed') return res.json({ status: 'pending' });
+  const order = db.prepare('SELECT * FROM orders WHERE code=?').get(checkout.order_code);
+  res.json({
+    status: 'completed',
+    code: checkout.order_code,
+    hasMeal: order ? !!order.has_meal : false,
+    total: checkout.total,
+    wantsStamp: !!checkout.wants_stamp,
+    orderType: checkout.order_type
   });
 });
 
