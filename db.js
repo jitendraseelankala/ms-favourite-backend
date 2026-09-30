@@ -17,7 +17,10 @@ db.exec(`
     voucher_applied TEXT,
     status TEXT NOT NULL DEFAULT 'received',
     order_type TEXT NOT NULL DEFAULT 'collection',
-    address TEXT
+    address TEXT,
+    decline_note TEXT,
+    payment_intent_id TEXT,
+    refund_status TEXT
   );
 
   CREATE TABLE IF NOT EXISTS stamps (
@@ -56,5 +59,8 @@ const existingCols = db.prepare("PRAGMA table_info(orders)").all().map(c => c.na
 if (!existingCols.includes('status')) db.exec("ALTER TABLE orders ADD COLUMN status TEXT NOT NULL DEFAULT 'received'");
 if (!existingCols.includes('order_type')) db.exec("ALTER TABLE orders ADD COLUMN order_type TEXT NOT NULL DEFAULT 'collection'");
 if (!existingCols.includes('address')) db.exec("ALTER TABLE orders ADD COLUMN address TEXT");
+if (!existingCols.includes('decline_note')) db.exec("ALTER TABLE orders ADD COLUMN decline_note TEXT");
+if (!existingCols.includes('payment_intent_id')) db.exec("ALTER TABLE orders ADD COLUMN payment_intent_id TEXT");
+if (!existingCols.includes('refund_status')) db.exec("ALTER TABLE orders ADD COLUMN refund_status TEXT");
 
 module.exports = db;
