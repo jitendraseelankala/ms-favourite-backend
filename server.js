@@ -42,11 +42,11 @@ function handlePaymentConfirmed(sessionId) {
   const code = uniqueOrderCode();
   const now = new Date().toISOString();
 
-  const tx = db.transaction(() => {
+  const tx = db.transaction((paymentIntentId) => {
     db.prepare(`
-      INSERT INTO orders (code, phone, items_json, total, has_meal, created_at, claimed, status, order_type, address)
-      VALUES (?, ?, ?, ?, ?, ?, 0, 'received', ?, ?)
-    `).run(code, checkout.phone, checkout.items_json, checkout.total, hasMeal ? 1 : 0, now, checkout.order_type, checkout.address);
+      INSERT INTO orders (code, phone, items_json, total, has_meal, created_at, claimed, status, order_type, address, payment_intent_id)
+      VALUES (?, ?, ?, ?, ?, ?, 0, 'received', ?, ?, ?)
+    `).run(code, checkout.phone, checkout.items_json, checkout.total, hasMeal ? 1 : 0, now, checkout.order_type, checkout.address, paymentIntentId || null);
 
     if (checkout.voucher_code) {
       db.prepare('UPDATE vouchers SET used=1, used_at=?, used_on_order=? WHERE code=?').run(now, code, checkout.voucher_code);
@@ -54,8 +54,14 @@ function handlePaymentConfirmed(sessionId) {
 
     db.prepare("UPDATE checkouts SET status='completed', order_code=? WHERE session_id=?").run(code, sessionId);
   });
-  tx();
-  return Promise.resolve();
+
+  // Fetch the session again to get the payment_intent id (needed later for refunds if staff decline the order)
+  return stripe.checkout.sessions.retrieve(sessionId).then(fullSession => {
+    tx(fullSession.payment_intent || null);
+  }).catch(e => {
+    console.error('Could not retrieve payment_intent for session', sessionId, e.message);
+    tx(null);
+  });
 }
 
 app.use(express.json());
@@ -118,7 +124,7 @@ app.post('/api/orders', (req, res) => {
 app.get('/api/orders/by-phone/:phone', (req, res) => {
   const phone = normPhone(req.params.phone);
   if (phone.length < 6) return res.status(400).json({ error: 'Please enter a valid phone number' });
-  const orders = db.prepare('SELECT code, items_json, total, has_meal, created_at, claimed, status, order_type FROM orders WHERE phone=? ORDER BY created_at DESC LIMIT 50').all(phone);
+  const orders = db.prepare('SELECT code, items_json, total, has_meal, created_at, claimed, status, order_type, decline_note FROM orders WHERE phone=? ORDER BY created_at DESC LIMIT 50').all(phone);
   const out = orders.map(o => ({
     code: o.code,
     items: JSON.parse(o.items_json),
@@ -127,7 +133,8 @@ app.get('/api/orders/by-phone/:phone', (req, res) => {
     createdAt: o.created_at,
     stampClaimed: !!o.claimed,
     status: o.status,
-    orderType: o.order_type
+    orderType: o.order_type,
+    declineNote: o.decline_note || null
   }));
   res.json({ orders: out });
 });
@@ -135,7 +142,11 @@ app.get('/api/orders/by-phone/:phone', (req, res) => {
 app.get('/api/orders/:code', (req, res) => {
   const order = db.prepare('SELECT * FROM orders WHERE code=?').get(req.params.code.toUpperCase());
   if (!order) return res.status(404).json({ error: 'Order not found' });
-  res.json({ ...order, items: JSON.parse(order.items_json) });
+  res.json({
+    ...order,
+    items: JSON.parse(order.items_json),
+    declineNote: order.decline_note || null
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -422,19 +433,43 @@ app.get('/api/staff/orders', requireStaff, (req, res) => {
     createdAt: o.created_at,
     status: o.status,
     orderType: o.order_type,
-    address: o.address
+    address: o.address,
+    declineNote: o.decline_note || null
   }));
   res.json({ orders: out });
 });
 
 // PATCH /api/orders/:code/status — staff moves an order through received -> accepted -> ready
-const VALID_STATUSES = ['received', 'accepted', 'ready'];
-app.patch('/api/orders/:code/status', requireStaff, (req, res) => {
+// or declines it (requires a note; triggers an automatic Stripe refund).
+const VALID_STATUSES = ['received', 'accepted', 'ready', 'declined'];
+app.patch('/api/orders/:code/status', requireStaff, async (req, res) => {
   const code = req.params.code.toUpperCase();
   const status = String(req.body.status || '');
+  const note = String(req.body.note || '').trim();
   if (!VALID_STATUSES.includes(status)) return res.status(400).json({ error: 'Invalid status' });
-  const order = db.prepare('SELECT code FROM orders WHERE code=?').get(code);
+  const order = db.prepare('SELECT * FROM orders WHERE code=?').get(code);
   if (!order) return res.status(404).json({ error: 'Order not found' });
+
+  if (status === 'declined') {
+    if (!note) return res.status(400).json({ error: 'Please add a short note explaining why the order is being declined' });
+
+    let refundStatus = 'not_attempted';
+    if (stripe && order.payment_intent_id) {
+      try {
+        await stripe.refunds.create({ payment_intent: order.payment_intent_id });
+        refundStatus = 'refunded';
+      } catch (err) {
+        console.error('Refund failed for order', code, err.message);
+        refundStatus = 'failed';
+      }
+    } else if (!order.payment_intent_id) {
+      refundStatus = 'no_payment_on_file';
+    }
+
+    db.prepare('UPDATE orders SET status=?, decline_note=?, refund_status=? WHERE code=?').run(status, note, refundStatus, code);
+    return res.json({ ok: true, code, status, refundStatus });
+  }
+
   db.prepare('UPDATE orders SET status=? WHERE code=?').run(status, code);
   res.json({ ok: true, code, status });
 });
